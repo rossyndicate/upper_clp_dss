@@ -1,0 +1,1273 @@
+---
+title: "Explore_Peak_Discharge"
+author: "KEC"
+date: "2026-03-17"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library("dplyr")
+library("tidyverse")
+library("ggplot2")
+library("sf")
+library("mapview")
+library("dataRetrieval")
+library("nhdplusTools")
+library("rvest")
+library("ggthemes")
+library("janitor")
+library("data.table")
+library("ggpubr")
+library("cdssr")
+library("broom")
+library("here")
+library("GGally")
+library("soilDB")
+library("purrr")
+library("ggcorrplot")
+library("mgcv")
+library("climateR")
+library("gratia")
+library("plotly")
+library("terra")
+library("tidyr")
+library("randomForest")
+
+
+```
+
+# Define get_snotel function
+
+This is a wrapper around soilDB::fetchSCAN() that retrieves SNOTEL/SCAN station 
+data either by spatial intersection with an AOI polygon or by explicit site 
+number. Data are fetched in parallel using furrr/future and assembled into a 
+single sf object to speed things up.
+
+```{r get_snotel,  message=FALSE, warning=FALSE, results='hide'}
+#' Pull in SNOTEL site data for an AOI <- imports SNOTEL and SCAN site data
+#'
+#' @param aoi An sf polygon/multipolygon object.
+#' @param dist The distance (in the same units as the aoi object) to buffer around the AOI
+#' @param years The years to pull data for. Default set to "all" which pulls all available years for each site, but can be a string of years
+#' @param timeseries either 'Daily' or 'Hourly
+#' @param save Whether to save the resulting file (TRUE/FALSE)
+#' @param path If `save == TRUE`, the file path to save to
+#' @return An sf object of weather stations within given spatial boundary and attributes
+
+getSNOTEL <- function(aoi,
+                      site_nums = NULL,
+                      dist = 0,
+                      years = "all",
+                      timeseries = "Daily",
+                      workers = 4,        # new: number of parallel workers
+                      save = FALSE,
+                      path = NULL) {
+
+  # --- site metadata setup (unchanged) ---
+  data('SCAN_SNOTEL_metadata', package = 'soilDB')
+  sites <- st_as_sf(SCAN_SNOTEL_metadata,
+                    coords = c("Longitude", "Latitude"),
+                    crs = 4326)
+
+  if (!is.null(aoi)) {
+    aoi <- aoi %>% sf::st_buffer(dist = dist)
+    site_aoi <- sites %>%
+      st_transform(st_crs(aoi)) %>%
+      st_filter(aoi) %>%
+      distinct(Site, .keep_all = TRUE) %>%
+      sf::st_join(aoi) %>%
+      dplyr::select(Name, Site, State, County = countyName,
+                    beginDate, endDate, Elevation_ft, HUC, geometry) %>%
+      dplyr::mutate(
+        start_year = ifelse(years %in% c("all", "All"), year(beginDate),  min(as.numeric(years))),
+        end_year   = ifelse(years %in% c("all", "All"), year(Sys.Date()), max(as.numeric(years)))
+      )
+  } else {
+    site_aoi <- sites %>%
+      distinct(Site, .keep_all = TRUE) %>%
+      dplyr::select(Name, Site, State, County = countyName,
+                    beginDate, endDate, Elevation_ft, HUC, geometry) %>%
+      dplyr::filter(Site %in% site_nums) %>%
+      dplyr::mutate(
+        start_year = ifelse(years %in% c("all", "All"), year(beginDate),  min(as.numeric(years))),
+        end_year   = ifelse(years %in% c("all", "All"), year(Sys.Date()), max(as.numeric(years)))
+      )
+  }
+
+  siteID <- unique(site_aoi$Site)
+
+  # --- Parallel fetch (replaces the for loop) ---
+  library(furrr)
+  library(progressr)
+
+  plan(multisession, workers = workers)
+
+  with_progress({
+    p <- progressor(along = siteID)
+
+    dat <- future_map(siteID, function(id) {
+      p(sprintf("Fetching site %s", id))
+
+      site_meta <- site_aoi[site_aoi$Site == id, ]
+
+      tryCatch(
+        soilDB::fetchSCAN(
+          site.code  = id,
+          year       = site_meta$start_year:site_meta$end_year,
+          timeseries = timeseries
+        ) %>%
+          map(~ mutate_all(., as.character)) %>%
+          bind_rows() %>%
+          as_tibble() %>%
+          dplyr::select(-(Name:pedlabsampnum)),
+
+        error = function(e) {
+          message("Site ", id, " failed: ", e$message)
+          NULL
+        }
+      )
+    }, .options = furrr_options(seed = TRUE))
+  })
+
+  plan(sequential)
+
+  # --- Assemble final output (unchanged) ---
+  final_data <- bind_rows(dat) %>%
+    left_join(site_aoi, by = "Site") %>%
+    st_as_sf() %>%
+    clean_names() %>%
+    mutate(
+      across(any_of(c("value", "elevation_ft", "depth", "water_year", "start_year", "end_year")), as.numeric),
+      across(any_of(c("date", "datetime")), as.Date)
+    )
+
+  if (save == TRUE) {
+    st_write(final_data, paste0(path, "/SNOTEL.shp"), append = FALSE)
+  }
+
+  return(final_data)
+}
+
+```
+
+
+
+# uCLP Network
+
+Read in uCLP Sonde Locations, set bounding box as area of interest, and
+plot.
+
+```{r uclp_network, message=FALSE, warning=FALSE}
+
+sonde_locs <- read.csv("data/raw/spatial/metadata/sonde_location_metadata.csv") %>%
+  dplyr::mutate(
+    lat = str_split(lat_long, pattern = ",", simplify = TRUE)[,1] %>% as.numeric(),
+    lng = str_split(lat_long, pattern = ",", simplify = TRUE)[,2] %>% as.numeric()) %>%
+  st_as_sf(coords = c("lng","lat"), crs = 4326)
+
+aoi <- sonde_locs %>%
+  st_bbox() %>%
+  st_as_sfc() %>%
+  st_as_sf()
+
+# Plot
+mapviewOptions(fgb = FALSE, georaster = FALSE)
+mapview(sonde_locs,
+        zcol = "Site") +
+  mapview(aoi, alpha.regions = 0)
+
+```
+
+# USGS
+
+Download all USGS discharge data within area of interest that spans sonde locs.
+This uses the new(ish) USGS Water Data API function calls. 
+
+```{r usgs_flow_gauges}
+
+# Define search area using aoi
+bbox_vals <- sf::st_bbox(aoi) %>%
+  as.numeric() %>% 
+  round(digits = 5)
+
+# Retrieve monitoring locations and calculate distance to water sources
+usgs_sw <- read_waterdata_monitoring_location(bbox = bbox_vals, site_type = "Stream") %>%
+  st_transform(crs = st_crs(aoi)) %>%
+  st_filter(aoi) 
+
+# View USGS SW stations
+mapview(usgs_sw,
+        layer.name = "USGS Flow Gauges")
+```
+
+
+Download daily discharge (parameter 00060, cfs) for all gauges found above. 
+Records are filtered to post-1980, joined to station metadata, and a 7-day 
+rolling mean (smooth_discharge) is calculated for downstream peak calculations.
+Day-of-year and water year are also added. Results are plotted with both raw 
+and smoothed time series for all stations.
+
+```{r usgs_discharge, warnings = FALSE}
+
+# Retrieve Daily Discharge Data for all stations in AOI
+usgs_discharge <- read_waterdata_daily(
+  monitoring_location_id = usgs_sw$monitoring_location_id,
+  parameter_code = "00060" # Discharge, cubic feet per second
+) %>%
+  # filter to sites with data after 1980
+  dplyr::filter(time > as.Date("1980-01-01"))
+
+# Refine station list based on successful/filtered data retrieval
+usgs_sw <- usgs_sw %>%
+  dplyr::filter(monitoring_location_id %in% unique(usgs_discharge$monitoring_location_id))
+
+# Join station metadata to discharge records
+tidy_discharge <- usgs_discharge %>%
+  left_join(usgs_sw %>% st_drop_geometry() %>%
+              dplyr::select(monitoring_location_id, 
+                            monitoring_location_name, 
+                            altitude, 
+                            agency_code),
+            by = "monitoring_location_id") %>%
+  dplyr::group_by(monitoring_location_id, monitoring_location_name) %>%
+  dplyr::mutate(doy = yday(time),
+                smooth_discharge = frollmean(value, n = 7),
+                discharge = value,
+                date = time,
+                water_year = calcWaterYear(date),
+                station_name = monitoring_location_name) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(date, 
+                water_year,
+                monitoring_location_id, 
+                station_name, 
+                altitude, 
+                agency_code, 
+                discharge, 
+                smooth_discharge, 
+                unit_of_measure)
+
+# Plot all stations
+ggplot(tidy_discharge, 
+       aes(x = date, color = station_name)) +
+  #geom_point() +
+  geom_line(aes(y = smooth_discharge)) +
+  geom_line(aes(y = discharge), alpha = 0.2) +
+  theme_bw() +
+  labs(y = "Discharge (cfs)") +
+  theme(legend.position = "none") +
+  facet_wrap(~station_name, scales = "free")
+```
+
+# Select Gauge and peak timing
+
+Subset to the Fort Collins gauge (Poudre at mouth of canyon), then for each 
+water year identify the single day of peak smoothed discharge during the 
+Jan–Jul snowmelt window. This gives one row per water year with the day-of-year
+of the annual flow peak. The NHDPlus watershed polygon for this gauge is also 
+retrieved for use in subsequent spatial analyses.
+
+```{r select_discharge, warning = FALSE}
+# Select ideal site
+usgs_discharge_select <- tidy_discharge %>%
+  dplyr::filter(grepl("FORT", station_name))
+
+# Extract annual peak discharge
+usgs_discharge_doy <- usgs_discharge_select %>%
+  group_by(station_name) %>%
+  mutate(
+    global_start = min(date),
+    global_end = max(date),
+    doy = yday(date),
+    year = year(date),
+    month = month(date),
+    water_year = calcWaterYear(date)
+  ) %>%
+  dplyr::filter(month %in% c(1,2,3,4,5,6,7)) %>%
+  group_by(station_name, water_year) %>%
+  # Filter for the row where value equals the maximum value of that group
+  dplyr::filter(smooth_discharge == max(smooth_discharge, na.rm = TRUE)) %>%
+  # Optional: If there are ties (two days with the same max), take the first one
+  dplyr::slice(1) %>% 
+  ungroup()
+
+# Select just the station at the Poudre River Mouth moving forward
+usgs_discharge_doy_s <- usgs_discharge_doy %>%
+  dplyr::filter(grepl("FORT", station_name))
+
+
+select_gage <- usgs_discharge_doy_s$monitoring_location_id[[1]] %>%
+  nhdplusTools::map_nhdplus()
+
+# Get watershed associated with gauge
+watershed <- select_gage$basin
+
+
+ggplot(usgs_discharge_doy_s, aes(x = water_year, y = doy)) +
+  geom_point() +
+  labs(x = "", y = "Peak Discharge DOY", title = usgs_discharge_doy_s$station_name[[1]]) +
+  theme_bw()
+
+
+#st_write(obj = watershed,
+#         dsn = "data/raw/spatial/poudre_gage_watershed.shp")
+  
+```
+
+# CDSSR
+
+Read in CDSSR data from colorado dss. Here, we retrieve surface water stations 
+and daily discharge time series from the Colorado Decision Support System via 
+the cdssr package. Negative discharge values (instrument errors) are set to NA.
+Stations that haven't reported in the last 3 days are filtered out to focus
+on sites with real-time / current data.
+
+Again, focus on the canyon mouth station ("MOUTH"). The CDSSR gauge loc is 
+upstream  of major irrigation diversions compared to the USGS gauge. See the 
+discharge comparison plot below for justification.
+
+```{r CDSSR}
+
+# Get stations in AOI
+cdssr_stations <- get_sw_stations(aoi = aoi, radius = 15) %>%
+  st_as_sf(coords = c("longitude", "latitude"), na.fail = FALSE, crs = 4326)
+
+# Get discharge in AOI
+cdssr_discharge <- cdssr_stations$station_num %>%
+  purrr::map_dfr(~ get_sw_ts(station_number = .)) %>% 
+         dplyr::left_join(cdssr_stations %>% 
+            dplyr::select(station_num, station_name, 
+                          county, water_district, more_information), 
+            by = c("station_num")) %>%
+  dplyr::mutate(value = ifelse(value < 0, NA, value))
+
+cdssr_stations_new <- cdssr_stations %>% 
+  filter(station_num %in% 
+           (cdssr_discharge %>% filter(datetime > as.Date(Sys.Date() - days(3))) %>%
+                  pull(station_num) %>%
+                    unique()))
+
+cdssr_tidy_discharge <- cdssr_discharge %>%
+  select(c("date" = datetime,
+           "monitoring_location_id" = station_num,
+           station_name,
+           "agency_code" = data_source,
+           "discharge" = value)) %>%
+  mutate(date = as.Date(date),
+          water_year = calcWaterYear(date)) %>%
+  group_by(water_year) %>%
+  dplyr::mutate(smooth_discharge = frollmean(discharge, n = 7),
+                unit_of_measure = "ft^3/s",
+                altitude = NA)
+
+
+cdssr_select_discharge <- cdssr_tidy_discharge %>%
+  dplyr::filter(grepl("MOUTH", station_name))
+
+ggplot(cdssr_select_discharge, #%>%
+ #        dplyr::filter(datetime > as.Date(Sys.Date()) - years(1)), 
+       aes(x = date, y = discharge, color = station_name)) +
+  geom_line() +
+  facet_wrap(~station_name, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# Extract annual peak discharge
+cdssr_discharge_doy <- cdssr_select_discharge %>%
+  group_by(station_name) %>%
+  mutate(
+    global_start = min(date),
+    global_end = max(date),
+    doy = yday(date),
+    year = year(date),
+    month = month(date),
+    water_year = calcWaterYear(date)
+  ) %>%
+  dplyr::filter(month %in% c(1,2,3,4,5,6,7)) %>%
+  group_by(station_name, water_year) %>%
+  # Filter for the row where value equals the maximum value of that group
+  dplyr::filter(smooth_discharge == max(smooth_discharge, na.rm = TRUE)) %>%
+  # Optional: If there are ties (two days with the same max), take the first one
+  dplyr::slice(1) %>% 
+  ungroup()
+
+ggplot(cdssr_discharge_doy, aes(x = water_year, y = doy)) +
+  labs(x = "", y = "Peak Discharge DOY", title = cdssr_discharge_doy$station_name[[1]]) +
+  geom_point() +
+  theme_bw()
+
+
+```
+
+# Compare cdssr and usgs
+
+Plot of CDSSR and USGS discharge. Canyon mouth discharge is greater (and upstream)
+implying less influence from diversions. This plot shows why using discharge at
+the canyon mouth is essential.
+
+```{r discharge_comp}
+
+comb_dis <- usgs_discharge_select %>%
+  select(date, station_name, discharge, water_year) %>%
+  bind_rows(cdssr_select_discharge %>% select(date, station_name, discharge, water_year)) %>%
+  filter(water_year > 1980)
+
+ggplot(comb_dis, aes(x = date, y = discharge, color = station_name)) +
+  geom_line() +
+  theme_bw() +
+  labs(color = "", x= "", y = "Discharge (cfs)")+
+  theme(legend.position = "bottom")
+
+
+```
+
+# SNOTEL
+
+Get SNOTEL data for all sites within AOI. Pull daily sensor records for three 
+pre-selected SNOTEL sites in the Poudre headwaters (Joe Wright 1122, 
+Long Draw 1123, Hourglass 551). Raw sensor data are widened, then melt (decline 
+in SWE) is computed and accumulated at 3/7/14/28-day windows. Cumulative 
+precipitation is differentiated to recover daily values.
+
+We also calculate snotel water year summary statistics for predicting peak 
+discharge and discharge timing. Note, we aim to make a prediction on April 1 
+here, so all statistics for a given year need to be measurable by that time.
+
+```{r get_SNOTEL}
+
+# Search for sites given AOI
+#snotel <- getSNOTEL(aoi = aoi,
+#                    dist = 5000,
+#                    years = "all",
+#                    save = FALSE) %>%
+#  clean_names() %>%
+#  st_transform(4326)
+
+# Since we already know the relevant sites
+snotel_site_nums <- c("1122", "1123", "551")
+snotel <- getSNOTEL(aoi = NULL,
+                    site_nums = snotel_site_nums,
+                    years = "all",
+                    save = FALSE) %>%
+  clean_names() %>%
+  st_transform(4326)
+
+# Get metadata
+snotel_metadata <- SCAN_sensor_metadata(site.code = snotel_site_nums)
+
+# Select unique sites for plotting locations
+snotel_sites <- snotel %>%
+  group_by(site) %>%
+  dplyr::slice(1) %>% 
+  ungroup()
+
+
+# Create clean version of snotel data
+snotel_tidy <- snotel %>%
+  st_drop_geometry() %>%
+  data.table() %>%
+  dplyr::filter(sensor_id %in% 
+                  c("PREC.I", "SNWD.I", "WTEQ.I", "TAVG.D", 
+                    "TMIN.D", "TMAX.D", "SMS.I_2", "SMS.I_8", "SMS.I_20" )) %>%
+  dplyr::select(date, name, value, sensor_id, water_year) %>%
+  dplyr::group_by(date, name, sensor_id) %>%
+  # Sometimes sensors have multiple values per day - summarize to daily with mean
+  dplyr::summarize(value = mean(value, na.rm = TRUE),
+                   water_year = mean(water_year, na.rm = TRUE), .groups = "keep") %>%
+  dplyr::group_by(date, name) %>%
+  pivot_wider(names_from = sensor_id, values_from = value) %>% 
+  clean_names() %>% 
+  dplyr::group_by(name) %>%
+  dplyr::mutate(melt = c(NA, diff(wteq_i))) %>%
+  dplyr::mutate(melt = ifelse(melt < 0, -melt, 0)) %>%
+  dplyr::mutate(melt_3_day = frollsum(melt, 3, align = "left"), 
+                melt_7_day = frollsum(melt, 7, align = "left"),
+                melt_14_day = frollsum(melt, 14, align = "left"),
+                melt_28_day = frollsum(melt, 28, align = "left"),
+                water_year = calcWaterYear(date)) %>%
+  group_by(name, water_year) %>%
+  arrange(date) %>%
+  mutate(
+    cum_prec_i = prec_i,
+    # Calculate daily precip from the cumulative 'prec_i' column
+    # pmax(0, ...) ensures we don't get negative precip if the sensor is reset
+    prec_i = pmax(0, prec_i - lag(prec_i, default = first(prec_i)))
+  ) %>%
+  ungroup()
+
+
+# Calculate snotel water year summary statistics for predicting
+# peak discharge and discharge timing. Note, we aim to make a prediction on
+# April 1 here, so all statistics for a given year need to be measurable by that 
+# time.
+
+# 1. Calculate Pre-April Summary Metrics
+annual_summary_base <- snotel_tidy %>%
+  mutate(
+    month = month(date),
+    doy = yday(date),
+    # Boolean flags for different seasonal windows
+    is_monsoon = month %in% c(7, 8, 9),
+    is_pre_apr = month > 9 | month < 4,
+    is_apr1    = month == 4 & day(date) == 1
+  ) %>%
+  group_by(name, water_year) %>%
+  summarize(
+    
+    # --- Peak & Melt Metrics (Oct-March window) ---
+    peak_swe = if(any(is_pre_apr)) max(wteq_i[is_pre_apr], na.rm = TRUE) else NA,
+    
+    peak_swe_doy = if(any(is_pre_apr & !is.na(wteq_i))) {
+        doy[is_pre_apr][which.max(wteq_i[is_pre_apr])]
+      } else {
+        NA_integer_
+      },
+      
+    total_precip = if(any(is_pre_apr)) max(prec_i[is_pre_apr], na.rm = TRUE) else NA,
+    max_daily_melt  = max(melt[is_pre_apr], na.rm = TRUE),
+    max_7day_melt   = max(melt_7_day[is_pre_apr], na.rm = TRUE),
+    precip_to_swe_ratio = if(any(!is.na(wteq_i[is_pre_apr])) && max(wteq_i[is_pre_apr], na.rm=T) > 0) {
+      max(prec_i[is_pre_apr], na.rm = TRUE) / max(wteq_i[is_pre_apr], na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    swe_centroid_doy = if(any(!is.na(wteq_i[is_pre_apr])) && sum(wteq_i[is_pre_apr], na.rm=T) > 0) {
+      sum(doy[is_pre_apr] * wteq_i[is_pre_apr], na.rm = TRUE) / sum(wteq_i[is_pre_apr], na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    
+    # --- Pre-April Climate/Ripening ---
+    early_melt_days     = sum(melt[is_pre_apr] > 0, na.rm = TRUE),
+    mean_temp_pre_april = mean(tavg_d[is_pre_apr], na.rm = TRUE),
+    
+    
+    # --- Soil Moisture Current Year (Oct-March) ---
+    soil_moisture_2  = mean(sms_i_2[is_pre_apr], na.rm = TRUE),
+    soil_moisture_8  = mean(sms_i_8[is_pre_apr], na.rm = TRUE),
+    soil_moisture_20 = mean(sms_i_20[is_pre_apr], na.rm = TRUE),
+    
+    # --- Monsoon Metrics (July-Sept window) ---
+    monsoon_total_precip = sum(prec_i[is_monsoon], na.rm = TRUE),
+    monsoon_intensity    = max(prec_i[is_monsoon], na.rm = TRUE), 
+    
+    # Monsoon Dry Spell logic
+    monsoon_dry_spell = {
+      m_prec = prec_i[is_monsoon]
+      m_prec = m_prec[!is.na(m_prec)] # Remove NAs first
+      if(length(m_prec) == 0) {
+        NA_real_ 
+      } else {
+        runs = rle(m_prec == 0)
+        # Only take max if there ARE dry days (values == TRUE)
+        if(any(runs$values)) max(runs$lengths[runs$values]) else 0
+      }
+    },
+    
+    # --- The April 1st Case ---
+    # Now handled internally since we didn't filter the main DF
+    swe_apr1 = wteq_i[is_apr1][1],
+    
+    .groups = "drop"
+  )
+
+# 2. Calculate Previous Year Soil Moisture and monsoon precip
+prev_year_soil <- annual_summary_base %>%
+  select(name, water_year, soil_moisture_2, soil_moisture_8, soil_moisture_20, 
+         monsoon_total_precip, monsoon_intensity, monsoon_dry_spell) %>%
+  mutate(water_year = water_year + 1) %>%
+  rename_with(~paste0(., "_prev"), starts_with(c("soil_moisture", "monsoon")))
+
+# 3. Final Join
+annual_snotel_summary <- annual_summary_base %>%
+  left_join(prev_year_soil, by = c("name", "water_year"))
+
+print(annual_snotel_summary)
+
+
+# plot map of sites
+#  mapview(snotel_sites,
+#          layer.name = "SNOTEL",
+#          col.regions = "darkblue")
+
+
+# Plot snotel data
+
+ggarrange(
+ggplot(snotel_tidy,
+       aes(x = date, y =prec_i, color = name)) +
+  geom_line() +
+  theme_bw() +
+  labs(y = "SWE"),
+ggplot(snotel_tidy,
+       aes(x = date, y = melt_28_day, color = name)) +
+  geom_line() +
+  theme_bw() +
+  labs(y = "Melt", color = ""),
+common.legend = TRUE, legend = "bottom")
+
+```
+
+```{r plot_site_locs}
+
+mapview(watershed) +
+   mapview(sonde_locs, col.regions = "seagreen") +
+mapview(cdssr_stations_new, col.regions = "red") +
+  mapview(usgs_sw, col.regions = "dodgerblue") +
+  mapview(snotel_sites, col.regions = "darkblue")
+
+
+```
+
+# Climate data
+
+Here, we bring in climate data (GridMET) for the entire watershed and summarize
+to the daily average.
+
+
+```{r gridmet}
+
+climate_data <- climateR::getGridMET(AOI = watershed,
+                                     varname = c("etr", "pr", "tmmx"),
+                                     startDate = "2010-01-01",
+                                     endDate = "2026-01-01",
+                                     dryrun = FALSE)
+
+clim_crs <- terra::crs(climate_data[[1]])
+
+watershed_trans <- watershed %>% st_transform(crs = clim_crs)
+
+climate_data <- climate_data %>%
+            purrr::map(~terra::crop(., terra::vect(watershed_trans), mask = TRUE)) %>%          
+            purrr::map_dfr(~ terra::as.data.frame(., xy = TRUE)) %>%
+            data.table::data.table() %>%
+            tidyr::pivot_longer(-c(x, y),
+                                names_to = "var_temp",
+                                values_to = "val") %>%
+            tidyr::separate_wider_delim(var_temp, "_", names = c("var", "date")) %>%
+            tidyr::drop_na(val) %>%
+            dplyr::group_by(x, y, date) %>%
+            tidyr::pivot_wider(names_from = "var", values_from = "val") %>%
+            dplyr::mutate(date = as.Date(date)) %>%
+            group_by(date) %>%
+            dplyr::summarize(ppt_in = 0.0393701 * sum(pr, na.rm = TRUE),
+                             tmmx = mean(tmmx - 273.15, na.rm = TRUE),
+                             etr_in = mean(etr * 0.0393701, na.rm = TRUE))
+                             
+
+clim_stats <- climate_data %>%
+  mutate(water_year = calcWaterYear(date),
+    month = month(date),
+    doy = yday(date),
+    is_monsoon = month %in% c(7, 8, 9),
+    is_pre_apr = month > 9 | month < 4) %>%
+  group_by(water_year) %>%
+  summarize(
+    gm_precip_in_sum = if(any(is_pre_apr)) sum(ppt_in[is_pre_apr], na.rm = TRUE) else NA,
+    gm_etr_in_mean = if(any(is_pre_apr)) mean(etr_in[is_pre_apr], na.rm = TRUE) else NA,
+    gm_etr_in_max = if(any(is_pre_apr)) max(etr_in[is_pre_apr], na.rm = TRUE) else NA,
+    gm_temp_c_max = if(any(is_pre_apr)) max(tmmx[is_pre_apr], na.rm = TRUE) else NA,
+    .groups = "drop") %>%
+  dplyr::filter(water_year > 2010)
+
+
+```
+
+Now, merge dischage and snotel data into a single dataframe "doy_data". Join the
+CDSSR canyon mouth peak discharge timing/magnitude records with the SNOTEL 
+annual summaries (Long Draw Reservoir) and GridMET climate stats into one df.
+
+```{r doy_merge}
+
+
+doy_data_2026 <- #usgs_discharge_doy_s %>% # Fort Collins Discharge
+  cdssr_discharge_doy %>% # Canyon Mouth Discharge
+  dplyr::rename(c("discharge_doy" = "doy",
+                  "peak_discharge" = "smooth_discharge")) %>%
+  left_join(annual_snotel_summary %>%
+              dplyr::filter(name == 
+                            #"Joe Wright"
+                            "Long Draw Resv"
+                            #"Hourglass Lake"
+                              ),
+            by = "water_year") %>%
+  left_join(clim_stats, by = "water_year") %>%
+  # Remove 1st year of data because of lagged variables
+  filter(water_year >= 2011)  %>%
+          select("water_year",
+                 "discharge_doy",
+                 "peak_discharge",
+                 "peak_swe",
+                 "peak_swe_doy",
+                 "total_precip",
+                 "max_daily_melt",
+                 #"max_melt_doy",
+                 "max_7day_melt",
+                 #"max_7day_melt_doy",
+                 "swe_apr1",
+                 "monsoon_total_precip_prev",
+                 "monsoon_intensity_prev",
+                 "monsoon_dry_spell_prev",
+                 #"soil_moisture_2",
+                 #"soil_moisture_8",
+                 #"soil_moisture_20",
+                 "soil_moisture_2_prev",
+                 "soil_moisture_8_prev",
+                 #"soil_moisture_20_prev",
+                 "mean_temp_pre_april",
+                 "swe_centroid_doy",
+                 "precip_to_swe_ratio",
+                 "gm_precip_in_sum",
+                 "gm_etr_in_mean",
+                 "gm_etr_in_max",
+                 "gm_temp_c_max"
+                 ) 
+
+doy_data <- doy_data_2026 %>%
+  dplyr::filter(water_year < 2026)
+
+
+```
+
+Now, explore the data. We start by exploring linear relationships between 
+dependent variables (peak_discharge and discharge_doy) and predictors. Compute 
+Pearson correlations among all predictors and the two targets (discharge_doy 
+and peak_discharge). Hierarchical clustering groups related variables together 
+to reveal blocks of correlated predictors (e.g., SWE metrics, soil moisture).
+
+```{r data_exploration,  fig.width=12, fig.height=10}
+
+# Create a plot of all variables
+#ggpairs(doy_data, columns = 2:ncol(doy_data), 
+#        upper = list(continuous = wrap("cor", size = 3)),
+#        mapping = aes(alpha = 0.5))
+
+
+# Correlation Matrix
+cor_matrix <- cor(doy_data %>% select(-water_year), 
+                  use = "complete.obs")
+
+ggcorrplot(cor_matrix, 
+           hc.order = TRUE,         # Clusters similar variables together
+           type = "lower",          # Only shows the bottom triangle (no duplicates)
+           lab = TRUE,              # Shows the actual correlation coefficients
+           lab_size = 3,
+           method = "square", 
+           colors = c("#E46726", "white", "#1f77b4"), # Prof. orange-blue scale
+           title = "Predictor Correlation Matrix",
+           ggtheme = theme_minimal())
+
+```
+
+Isolate and rank correlations between each predictor and the two targets 
+(discharge timing and magnitude). Then fit a separate simple linear regression 
+for every predictor and report R² — shows which individual variables carry the 
+most linear explanatory power before multivariate models.
+
+```{r target_cors, warning = FALSE}
+# Calculate correlations specifically for targets
+target_cors <- as.data.frame(cor_matrix) %>%
+  rownames_to_column("Variable") %>%
+  select(Variable, discharge_doy, peak_discharge) %>%
+  filter(!Variable %in% c("discharge_doy", "peak_discharge")) %>%
+  pivot_longer(cols = -Variable, names_to = "Target", values_to = "Correlation")
+
+# Plot
+ggplot(target_cors, aes(x = reorder(Variable, Correlation), y = Correlation, fill = Target)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("discharge_doy" = "#1f77b4", "peak_discharge" = "#E46726")) +
+  labs(title = "Correlation of Predictors with Discharge Timing and Magnitude",
+       x = "SNOTEL / Climate Variable",
+       y = "Pearson Correlation (r)") +
+  theme_minimal()
+
+
+# Now, find individual R_squared using lm
+predictors <- names(doy_data)[3:ncol(doy_data)]
+
+# Map through predictors to find the best individual R-squared
+doy_results <- predictors %>%
+  map_df(~{
+    formula <- as.formula(paste("discharge_doy ~", .x))
+    mod <- lm(formula, data = doy_data)
+    tibble(variable = .x, r_squared = summary(mod)$r.squared)
+  }) %>%
+  arrange(desc(r_squared))
+
+print(doy_results)
+
+mag_results <- predictors %>%
+  map_df(~{
+    formula <- as.formula(paste("peak_discharge ~", .x))
+    mod <- lm(formula, data = doy_data)
+    tibble(variable = .x, r_squared = summary(mod)$r.squared)
+  }) %>%
+  arrange(desc(r_squared))
+
+print(mag_results)
+
+
+```
+
+Now, we use some other methods to explore predictor power, moving
+outside assumptions of linear relationships.
+
+First, we explore random forest for variable importance. This method
+captures non-linear relationships and ranks variables by how much the
+model's accuracy drops when they are removed.
+
+-   %IncMSE (Mean Squared Error): Higher is better. If you "scramble"
+    this variable, how much does the model's error jump? If a variable
+    has a high %IncMSE, it means the model is heavily reliant on that
+    variable for accurately predicting y.
+
+-   IncNodePurity (Gini): Higher is more "pure." Measures how much the
+    variable helps split the data into clean groups. This is a
+    "structural" importance. High values here suggest the variable is a
+    very consistent branching point in the forest's logic.
+    
+
+```{r timing_rf}
+# Timing (discharge_doy)
+rf_timing <- randomForest(discharge_doy ~ . - peak_discharge, 
+                          data = doy_data %>% select(-water_year), importance = TRUE, na.action = na.omit)
+
+importance_timing <- as.data.frame(importance(rf_timing)) %>%
+  rownames_to_column(var = "Variable") %>%
+  # Sort by %IncMSE (Percent Increase in Mean Squared Error)
+  arrange(desc(`%IncMSE`))
+
+print(importance_timing %>% head())
+
+# IncMSE results indicate that discharge_doy is most influenced by:
+# precip_to_swe_ratio, max_7day_melt_doy, soil_moisture_2_prev, max_7day_melt, max_daily_melt
+
+ggplot(importance_timing, aes(x = reorder(Variable, `%IncMSE`), y = `%IncMSE`)) +
+  geom_point(size = 3, color = "#003366") +
+  geom_segment(aes(x = Variable, xend = Variable, y = 0, yend = `%IncMSE`), color = "grey") +
+  coord_flip() +
+  labs(title = "Variable Importance: Peak Discharge Timing",
+       x = "Predictor",
+       y = "% Increase in MSE (Importance)") +
+  theme_minimal()
+
+
+```
+    
+
+```{r magnitude_rf}
+
+# Magnitude (peak_discharge)
+rf_magnitude <- randomForest(peak_discharge ~ . - discharge_doy, 
+                             data = doy_data %>% select(-water_year), importance = TRUE, 
+                             na.action = na.omit)
+
+# --- Magnitude Model (peak_discharge) ---
+importance_magnitude <- as.data.frame(importance(rf_magnitude)) %>%
+  rownames_to_column(var = "Variable") %>%
+  arrange(desc(`%IncMSE`))
+
+print(importance_magnitude %>% head())
+
+# IncMSE results indicate that peak discharge is most influenced by:
+# soil_moisture_2, total_precip, max_daily_melt, peak_swe, max_7day_melt_doy
+
+
+ggplot(importance_magnitude, aes(x = reorder(Variable, `%IncMSE`), y = `%IncMSE`)) +
+  geom_point(size = 3, color = "#003366") +
+  geom_segment(aes(x = Variable, xend = Variable, y = 0, yend = `%IncMSE`), color = "grey") +
+  coord_flip() +
+  labs(title = "Variable Importance: Peak Discharge Magnitude",
+       x = "Predictor",
+       y = "% Increase in MSE (Importance)") +
+  theme_minimal()
+
+
+```
+
+
+Since relationships are rarely linear (e.g., the effect of temperature
+on snowmelt usually follows a curve rather than a straight line), we'll
+test a Generalized Additive Model (GAM) that fits smooth splines to each
+predictor. This is particularly useful for variables like
+mean_temp_pre_april, where there might be a threshold effect.
+
+```{r test_Gam_timing}
+
+# 1. Model for Peak Timing (discharge_doy)
+# We use 's()' for smooth terms. 
+# 'k = 4' limits the "wiggliness" to prevent overfitting with small datasets.
+#
+#
+# Previous analyses indicated the following were key variables:
+# RF: soil_moisture_8_prev, monsoon_intensity_prev, max_daily_melt
+# Corr: soil_moisture_8_prev, monsoon_dry_spell_prev, monsoon_intensity_prev
+
+
+ # ADD LEAVE ONE OUT
+gam_timing <- gam(discharge_doy ~ s(soil_moisture_8_prev, k = 4) +
+                                  #s(monsoon_total_precip_prev, k = 4) +
+                                  #s(gm_precip_in_sum, k = 4),
+                                  s(peak_swe, k = 4),
+                                  #s(monsoon_dry_spell_prev, k = 3),
+                                  #s(gm_etr_in_mean, k = 3),
+                                  ##s(monsoon_intensity_prev, k = 4),
+                                  #s(soil_moisture_2_prev, k = 3),
+                                  #s(soil_moisture_2, k = 4),
+                  data = doy_data, 
+                  method = "REML") # REML is more robust for small samples
+
+# Print some gam stats
+summary(gam_timing)
+
+gam.check(gam_timing)
+
+# Plot gam performance
+appraise(gam_timing)
+
+```
+
+```{r test_gam_magnitude}
+# 2. Model for Peak Magnitude (peak_discharge)
+#
+# Previous methods identified the following predictors:
+# RF: monsoon_total_precip_prev, peak_swe, total_precip
+# Corr: peak_swe, swe_apr1, total_precip, monsoon_total_precip_prev
+
+gam_magnitude <- gam(peak_discharge ~ s(monsoon_total_precip_prev, k = 4) +
+                                      s(peak_swe, k = 4),
+                                      #s(gm_etr_in_mean, k = 4),
+                                      #s(max_daily_melt, k = 4),
+                     data = doy_data, 
+                     method = "REML")
+
+# Again print stats
+summary(gam_magnitude)
+
+# Plot performance
+appraise(gam_magnitude)
+
+
+```
+
+Now, we'll develop n models using leave one out to create an ensemble
+prediction.
+
+```{r loo_ensemble_timing}
+library(mgcv)
+library(dplyr)
+
+# 1. Remove rows with NAs
+vars_needed <- c("discharge_doy", "soil_moisture_8_prev", "peak_swe")
+doy_data_clean <- doy_data %>% filter(if_all(all_of(vars_needed), ~!is.na(.)))
+
+n <- nrow(doy_data_clean)
+n_dropped <- nrow(doy_data) - n
+if (n_dropped > 0) message(n_dropped, " row(s) dropped due to missing values.")
+
+# 2. Fit n LOO models, storing each one
+#    Also capture each point's true out-of-sample prediction
+loo_models <- vector("list", n)
+loo_preds  <- numeric(n)
+
+for (i in 1:n) {
+  loo_models[[i]] <- gam(discharge_doy ~ s(soil_moisture_8_prev, k = 4) +
+                                         s(peak_swe, k = 4),
+                         data   = doy_data_clean[-i, ],
+                         method = "REML")
+  
+  # True out-of-sample prediction: model i never saw point i
+  loo_preds[i] <- predict(loo_models[[i]], newdata = doy_data_clean[i, ])
+}
+
+# 3. Build ensemble predictions by averaging across all n LOO models
+#    Result is an n x n matrix: rows = data points, cols = LOO models
+pred_matrix <- matrix(NA, nrow = n, ncol = n)
+
+for (j in 1:n) {
+  pred_matrix[, j] <- predict(loo_models[[j]], newdata = doy_data_clean)
+}
+
+ensemble_preds <- rowMeans(pred_matrix)
+
+# 4. Compile results — two prediction columns for comparison
+doy_results <- doy_data_clean %>%
+  mutate(
+    loo_pred       = loo_preds,       # each point predicted by the model that excluded it
+    ensemble_pred  = ensemble_preds,  # average across all n LOO models
+    loo_error      = discharge_doy - loo_pred,
+    ensemble_error = discharge_doy - ensemble_pred
+  )
+
+# 5. Performance metrics for both approaches
+ss_tot <- sum((doy_data_clean$discharge_doy - mean(doy_data_clean$discharge_doy))^2)
+
+rmse_loo      <- sqrt(mean(doy_results$loo_error^2))
+mae_loo       <-      mean(abs(doy_results$loo_error))
+r2_loo        <- 1 - sum(doy_results$loo_error^2) / ss_tot
+
+rmse_ensemble <- sqrt(mean(doy_results$ensemble_error^2))
+mae_ensemble  <-      mean(abs(doy_results$ensemble_error))
+r2_ensemble   <- 1 - sum(doy_results$ensemble_error^2) / ss_tot
+
+# 6. Print results
+cat("--- LOO Out-of-Sample Performance ---\n")
+cat("RMSE: ", round(rmse_loo,      2), " days\n", sep = "")
+cat("MAE:  ", round(mae_loo,       2), " days\n", sep = "")
+cat("R²:   ", round(r2_loo,        3), "\n\n",    sep = "")
+
+cat("--- Ensemble Performance (all n LOO models averaged) ---\n")
+cat("RMSE: ", round(rmse_ensemble, 2), " days\n", sep = "")
+cat("MAE:  ", round(mae_ensemble,  2), " days\n", sep = "")
+cat("R²:   ", round(r2_ensemble,   3), "\n",      sep = "")
+```
+
+```{r loo_ensemble_magnitude}
+library(mgcv)
+library(dplyr)
+
+# 1. Remove rows with NAs
+vars_needed_mag <- c("peak_discharge", "monsoon_total_precip_prev", "peak_swe")
+doy_data_clean_mag <- doy_data %>% filter(if_all(all_of(vars_needed_mag), ~!is.na(.)))
+
+n_mag <- nrow(doy_data_clean_mag)
+n_dropped <- nrow(doy_data) - n_mag
+if (n_dropped > 0) message(n_dropped, " row(s) dropped due to missing values.")
+
+# 2. Fit n LOO models, storing each one
+loo_models_mag <- vector("list", n_mag)
+loo_preds_mag  <- numeric(n_mag)
+
+for (i in 1:n_mag) {
+  loo_models_mag[[i]] <- gam(peak_discharge ~ s(monsoon_total_precip_prev, k = 4) +
+                                              s(peak_swe, k = 4),
+                             data   = doy_data_clean_mag[-i, ],
+                             method = "REML")
+  
+  # True out-of-sample prediction: model i never saw point i
+  loo_preds_mag[i] <- predict(loo_models_mag[[i]], newdata = doy_data_clean_mag[i, ])
+}
+
+# 3. Build ensemble predictions by averaging across all n LOO models
+pred_matrix_mag <- matrix(NA, nrow = n_mag, ncol = n_mag)
+
+for (j in 1:n_mag) {
+  pred_matrix_mag[, j] <- predict(loo_models_mag[[j]], newdata = doy_data_clean_mag)
+}
+
+ensemble_preds_mag <- rowMeans(pred_matrix_mag)
+
+# 4. Compile results
+mag_results <- doy_data_clean_mag %>%
+  mutate(
+    loo_pred       = loo_preds_mag,
+    ensemble_pred  = ensemble_preds_mag,
+    loo_error      = peak_discharge - loo_pred,
+    ensemble_error = peak_discharge - ensemble_pred
+  )
+
+# 5. Performance metrics
+ss_tot_mag <- sum((doy_data_clean_mag$peak_discharge - mean(doy_data_clean_mag$peak_discharge))^2)
+
+rmse_loo_mag      <- sqrt(mean(mag_results$loo_error^2))
+mae_loo_mag       <-      mean(abs(mag_results$loo_error))
+r2_loo_mag        <- 1 - sum(mag_results$loo_error^2) / ss_tot_mag
+
+rmse_ensemble_mag <- sqrt(mean(mag_results$ensemble_error^2))
+mae_ensemble_mag  <-      mean(abs(mag_results$ensemble_error))
+r2_ensemble_mag   <- 1 - sum(mag_results$ensemble_error^2) / ss_tot_mag
+
+# 6. Print results
+cat("--- Magnitude LOO Out-of-Sample Performance ---\n")
+cat("RMSE: ", round(rmse_loo_mag,      2), " cfs\n", sep = "")
+cat("MAE:  ", round(mae_loo_mag,       2), " cfs\n", sep = "")
+cat("R²:   ", round(r2_loo_mag,        3), "\n\n",   sep = "")
+
+cat("--- Magnitude Ensemble Performance (all n LOO models averaged) ---\n")
+cat("RMSE: ", round(rmse_ensemble_mag, 2), " cfs\n", sep = "")
+cat("MAE:  ", round(mae_ensemble_mag,  2), " cfs\n", sep = "")
+cat("R²:   ", round(r2_ensemble_mag,   3), "\n",     sep = "")
+```
+
+# Now, make predictions for 2026 using ensemble GAMs.
+
+```{r timing_fit}
+
+# Filter to just the 2026 row for prediction
+new_data_2026 <- doy_data_2026 %>% filter(water_year == 2026)
+
+# 1. Generate ensemble predictions for 2026
+pred_2026_list <- lapply(loo_models, function(m) {
+  predict(m, newdata = new_data_2026, se.fit = TRUE)
+})
+
+# Force to matrix even when new_data_2026 is a single row
+fit_matrix_2026 <- matrix(sapply(pred_2026_list, function(p) as.numeric(p$fit)),
+                          nrow = 1)
+se_matrix_2026  <- matrix(sapply(pred_2026_list, function(p) as.numeric(p$se.fit)),
+                          nrow = 1)
+
+# Now apply works correctly
+na_cols <- which(apply(fit_matrix_2026, 2, function(x) any(is.na(x))))
+if (length(na_cols) > 0) {
+  message(length(na_cols), " LOO model(s) excluded due to NA predictions.")
+  fit_matrix_2026 <- fit_matrix_2026[, -na_cols, drop = FALSE]
+  se_matrix_2026  <- se_matrix_2026[,  -na_cols, drop = FALSE]
+}
+
+# Ensemble point estimate and combined uncertainty
+ensemble_fit_2026   <- mean(fit_matrix_2026)
+mean_se2_2026       <- mean(se_matrix_2026^2)
+intermodel_var_2026 <- var(as.numeric(fit_matrix_2026))
+ensemble_se_2026    <- sqrt(mean_se2_2026 + intermodel_var_2026)
+
+# 2. Build prediction row for 2026
+pred_2026 <- new_data_2026 %>%
+  mutate(
+    predicted = ensemble_fit_2026,
+    se        = ensemble_se_2026,
+    lwr       = predicted - 1.96 * se,
+    upr       = predicted + 1.96 * se
+  )
+
+# 3. Build historical fitted values from the ensemble (already computed)
+hist_results <- doy_data_clean %>%
+  mutate(
+    predicted = ensemble_preds,   # from loo_ensemble_timing chunk
+    error     = discharge_doy - predicted
+  )
+
+# 4. Plots
+p1 <- ggplot() +
+  # Historical observations
+  geom_point(data = hist_results,
+             aes(x = water_year, y = discharge_doy, color = "Observed"),
+             alpha = 0.6) +
+  # 2026 ensemble prediction
+  geom_point(data = pred_2026,
+             aes(x = water_year, y = predicted, color = "Predicted"),
+             size = 3) +
+  # 95% CI — combines model SE and inter-model spread
+  geom_errorbar(data = pred_2026,
+                aes(x = water_year, ymin = lwr, ymax = upr, color = "Predicted"),
+                width = 0.2, linewidth = 0.8) +
+  scale_color_manual(values = c("Observed" = "black", "Predicted" = "red")) +
+  labs(
+    title    = "Water Year 2026 Discharge Timing Prediction",
+    subtitle = "Error bars represent 95% CI (model SE + inter-model variance)",
+    x        = "Water Year",
+    y        = "Peak Discharge (Day of Year)",
+    color    = ""
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p2 <- ggplot(hist_results, aes(x = discharge_doy, y = predicted)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, color = "black",
+              linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = -Inf, y = Inf,
+           label = paste0("Ensemble R² = ", round(r2_ensemble, 2)),
+           hjust = -0.3, vjust = 2, size = 5) +
+  labs(
+    title    = "LOO Ensemble GAM: Modeled vs. Observed Discharge DOY",
+    subtitle = "Ensemble prediction averaged across all n LOO models",
+    x        = "Observed (Day of Year)",
+    y        = "Modeled (Day of Year)"
+  ) +
+  theme_bw()
+
+ggarrange(p1, p2, align = "hv")
+```
+
+```{r magnitude_fit}
+# Filter to just the 2026 row
+new_data_2026_mag <- doy_data_2026 %>% filter(water_year == 2026)
+
+# 1. Generate ensemble predictions for 2026 using magnitude LOO models
+pred_2026_list_mag <- lapply(loo_models_mag, function(m) {
+  predict(m, newdata = new_data_2026_mag, se.fit = TRUE)
+})
+
+# Force to matrix even when new_data_2026_mag is a single row
+fit_matrix_2026_mag <- matrix(sapply(pred_2026_list_mag, function(p) as.numeric(p$fit)),
+                              nrow = 1)
+se_matrix_2026_mag  <- matrix(sapply(pred_2026_list_mag, function(p) as.numeric(p$se.fit)),
+                              nrow = 1)
+
+# Check for and remove NA columns
+na_cols_mag <- which(apply(fit_matrix_2026_mag, 2, function(x) any(is.na(x))))
+if (length(na_cols_mag) > 0) {
+  message(length(na_cols_mag), " LOO model(s) excluded due to NA predictions.")
+  fit_matrix_2026_mag <- fit_matrix_2026_mag[, -na_cols_mag, drop = FALSE]
+  se_matrix_2026_mag  <- se_matrix_2026_mag[,  -na_cols_mag, drop = FALSE]
+}
+
+# Ensemble point estimate and combined uncertainty
+ensemble_fit_2026_mag   <- mean(fit_matrix_2026_mag)
+mean_se2_2026_mag       <- mean(se_matrix_2026_mag^2)
+intermodel_var_2026_mag <- var(as.numeric(fit_matrix_2026_mag))
+ensemble_se_2026_mag    <- sqrt(mean_se2_2026_mag + intermodel_var_2026_mag)
+
+# 2. Build prediction row for 2026
+pred_2026_mag <- new_data_2026_mag %>%
+  mutate(
+    predicted = ensemble_fit_2026_mag,
+    se        = ensemble_se_2026_mag,
+    lwr       = predicted - 1.96 * se,
+    upr       = predicted + 1.96 * se
+  )
+
+# 3. Historical ensemble fitted values (from loo_ensemble_magnitude chunk)
+hist_results_mag <- doy_data_clean_mag %>%
+  mutate(
+    predicted = ensemble_preds_mag,
+    error     = peak_discharge - predicted
+  )
+
+# 4. Plots
+p1_mag <- ggplot() +
+  geom_point(data = hist_results_mag,
+             aes(x = water_year, y = peak_discharge, color = "Observed"),
+             alpha = 0.6) +
+  geom_point(data = pred_2026_mag,
+             aes(x = water_year, y = predicted, color = "Predicted"),
+             size = 3) +
+  geom_errorbar(data = pred_2026_mag,
+                aes(x = water_year, ymin = lwr, ymax = upr, color = "Predicted"),
+                width = 0.2, linewidth = 0.8) +
+  scale_color_manual(values = c("Observed" = "black", "Predicted" = "red")) +
+  labs(
+    title    = "Water Year 2026 Peak Discharge Magnitude Prediction",
+    subtitle = "Error bars represent 95% CI (model SE + inter-model variance)",
+    x        = "Water Year",
+    y        = "Peak Discharge (cfs)",
+    color    = ""
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+p2_mag <- ggplot(hist_results_mag, aes(x = peak_discharge, y = predicted)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, color = "black",
+              linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = -Inf, y = Inf,
+           label = paste0("Ensemble R² = ", round(r2_ensemble_mag, 2)),
+           hjust = -0.3, vjust = 2, size = 5) +
+  labs(
+    title    = "LOO Ensemble GAM: Modeled vs. Observed Peak Discharge",
+    subtitle = "Ensemble prediction averaged across all n LOO models",
+    x        = "Observed (cfs)",
+    y        = "Modeled (cfs)"
+  ) +
+  theme_bw()
+
+ggarrange(p1_mag, p2_mag, align = "hv")
+```
