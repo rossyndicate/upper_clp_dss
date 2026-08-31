@@ -1,0 +1,989 @@
+---
+title: 'Assess TOC CLP Forecast (2026)'
+author: "Sam Struthers & B Steele-CSU"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+source("src/setup_libraries.R")
+source("src/setup_ross_theme.R")
+source("src/collation/read_ext.R")
+library(ggplot2)
+library(ggspatial)
+library(sf)
+library(tigris) 
+library(ggnewscale)
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(leafem)
+library(mapview)
+library(nhdplusTools)
+library(here)
+library(arrow)
+library(clipr)
+library(snotelr)
+library(mgcv)
+library(Metrics)
+library(glue)
+library(SHAPforxgboost)
+
+### ----- Helper functions ----- ###
+# Both helpers assume the three GAMs (q_doy_int, q_doy_swe, q_doy_swe_7d) are
+# already loaded, and that the input data has the columns those models need
+# (canyon_mouth_cfs, swe_pca, doy, etc.) plus a `mean_TOC` column to score against.
+
+# Standard "model" factor levels/labels used everywhere below, so every
+# plot/table sorts and labels the three GAMs consistently.
+model_levels <- c("pred_doy_int", "pred_doy_swe", "pred_doy_swe_7")
+model_labels <- c("DOY + Q Model", "DOY + Q + SWE 14d Model", "DOY + Q + SWE 7d Model")
+
+#' Predict TOC with all three GAMs and pivot to long format
+#'
+#' Adds pred_doy_int/pred_doy_swe/pred_doy_swe_7 columns, then pivots them into
+#' a single `model`/`pred` pair with nice factor labels for faceting.
+add_toc_gam_preds <- function(data) {
+  #check to make sure q_doy_int, q_doy_swe, and q_doy_swe_7d are loaded
+  if (!exists("q_doy_int") | !exists("q_doy_swe") | !exists("q_doy_swe_7d")) {
+    stop("One or more GAM models (q_doy_int, q_doy_swe, q_doy_swe_7d) are not loaded in the environment.")
+  }
+  #check to make sure data has the columns needed for prediction
+  required_cols <- c("canyon_mouth_cfs", "swe_pca", "doy")
+  if (!all(required_cols %in% colnames(data))) {
+    stop("Input data is missing one or more required columns: ", paste(setdiff(required_cols, colnames(data)), collapse = ", "))
+  }
+  
+  data %>%
+    mutate(
+      pred_doy_int   = as.numeric(predict(q_doy_int, .)),
+      pred_doy_swe   = as.numeric(predict(q_doy_swe, .)),
+      pred_doy_swe_7 = as.numeric(predict(q_doy_swe_7d, .))
+    ) %>%
+    pivot_longer(
+      cols = all_of(model_levels),
+      names_to = "model",
+      values_to = "pred"
+    ) %>%
+    mutate(model = factor(model, levels = model_levels, labels = model_labels))
+}
+
+#' Summarize TOC forecast error (ME, MAE, RMSE, bias) by horizon (and model)
+#'
+#' Expects `data` to already have `model`, `pred`, `mean_TOC`, and (unless
+#' group_vars is changed) `horizon` columns -- i.e. call after add_toc_gam_preds().
+#' Returns metrics pivoted long (one row per metric), ready to bind_rows() with
+#' the horizon == 0 "observed" baseline (actual_2026_metrics).
+summarize_toc_error <- function(data, group_vars = c("model", "horizon")) {
+  data %>%
+    filter(!is.na(mean_TOC)) %>%
+    summarize(
+      ME   = mean(pred - mean_TOC, na.rm = TRUE),
+      MAE  = mean(abs(pred - mean_TOC), na.rm = TRUE),
+      RMSE = sqrt(mean((pred - mean_TOC)^2, na.rm = TRUE)),
+      bias = bias(predicted = pred, actual = mean_TOC),
+      n    = n(),
+      .by = all_of(group_vars)
+    ) %>%
+    pivot_longer(cols = c(ME, MAE, RMSE, bias), names_to = "metric", values_to = "value")
+}
+
+chem_expressions <- list(
+  "Turbidity" = expression(Turbidity ~ (NTU)),
+  "TSS"       = expression(TSS ~ (mg ~ L^{-1})),
+  "ChlA"      = expression(Chlorophyll ~ italic("a") ~ (mu*g ~ L^{-1})),
+  "TOC"        = expression(TOC ~ (mg ~ L^{-1})),
+  "TN"        = expression(TN ~ (mg ~ L^{-1})),
+  "DOC"       = expression(DOC ~ (mg ~ L^{-1})),
+  "DTN"       = expression(TDN ~ (mg ~ L^{-1})),
+  "pH"        = expression(pH),
+  "ANC"       = expression(ANC ~ (mu*eq ~ L^{-1})),
+  "SC"        = expression(SC ~ (mu*S ~ cm^{-1})),
+  "Na"        = expression(Na^{"+"} ~ (mg ~ L^{-1})),
+  "NH4"       = expression(NH[4]^{"+"} ~ (mg ~ L^{-1})),
+  "K"         = expression(K^{"+"} ~ (mg ~ L^{-1})),
+  "Mg"        = expression(Mg^{"2+"} ~ (mg ~ L^{-1})),
+  "Ca"        = expression(Ca^{"2+"} ~ (mg ~ L^{-1})),
+  "F"         = expression(F^{"-"} ~ (mg ~ L^{-1})),
+  "Cl"        = expression(Cl^{"-"} ~ (mg ~ L^{-1})),
+  "NO3"       = expression(NO[3]^{"-"} ~ (mg ~ L^{-1})),
+  "PO4"       = expression(PO[4]^{"3-"} ~ (mg ~ L^{-1})),
+  "SO4"       = expression(SO[4]^{"2-"} ~ (mg ~ L^{-1})), 
+  "Flow"      = expression(Flow ~ (cfs)), 
+  "Alk"       = expression(Alkalinity ~ (mg ~ L^{-1} ~ as ~ CaCO[3])), 
+  "mgL"       = expression((mg ~ L^{-1})), 
+  "crps_toc"      = expression(CRPS ~ (mg ~ L^{-1})), 
+  "crps_cfs"     = expression(CRPS ~ (cfs))
+)
+
+### ----- Color Sets ----- ###
+
+cbbPalette <- c( "#999999","#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+
+ROSS_lt_pal <- c("#002EA3", "#E70870", "#256BF5",
+                 "#745CFB", "#1E4D2B", "#56104E")
+
+ROSS_dk_pal <- c("#1E4D2B", "#E70870", "#256BF5",
+                 "#FFCA3A", "#745CFB", "#C3F73A")
+
+ROSS_acc_pal <- c("#56104E", "#745CFB", "#FFCA3A", "#1E4D2B")
+
+```
+
+
+```{r}
+# Read in Models
+q_doy_int <- read_rds(here("data/derived/models/TOC_intake/TOC_intake_GAM_Q_doy_v2026-07-01.rds"))
+q_doy_swe <- read_rds(here("data/derived/models/TOC_intake/TOC_intake_GAM_Q_swe-melt14_v2026-07-01.rds"))
+q_doy_swe_7d <- read_rds(here("data/derived/models/TOC_intake/TOC_intake_GAM_Q_swe-melt7_v2026-07-01.rds"))
+
+```
+
+
+# Read in TOC data
+
+```{r}
+
+new_toc <- read_xlsx(here("data/raw/fc_intake_data/Poudre_RWSS_TOC_202603_20260727.xlsx"))%>%
+  select(date = `Sampled Date` , 
+         mean_TOC = `Corrected Result`)%>%
+  mutate(date = as.Date(date),
+  year = year(date),
+         doy = yday(date))
+
+check_intake_toc <- read_csv("data/raw/fc_intake_data/Poudre_Intake_TOC_2010-2025.csv", show_col_types = F)%>%
+    select(site = `Location Name`, date = `Sampled Date` , 
+         mean_TOC = `Corrected Result`)%>%
+  mutate(date = as.Date(date, format = "%m/%d/%Y"),
+  year = year(date),
+         doy = yday(date), 
+  mean_TOC = as.numeric(mean_TOC))%>%
+  na.omit()%>%
+  summarise(mean_TOC = mean(mean_TOC, na.rm = T), .by = c("date", "site"))
+
+
+check_rwss_toc <- read_csv("data/raw/fc_intake_data/Poudre_Raw_Water_Sample_Station_TOC_2010-2025.csv", show_col_types = F)%>%
+    select(site = `Location Name`, date = `Sampled Date` , 
+         mean_TOC = `Corrected Result`)%>%
+  mutate(date = as.Date(date, format = "%m/%d/%Y"),
+  year = year(date),
+         doy = yday(date), 
+  mean_TOC = as.numeric(mean_TOC))%>%
+  na.omit()%>%
+  summarise(mean_TOC = mean(mean_TOC, na.rm = T), .by = c("date", "site"))
+
+```
+
+## Join and double check Intake vs Raw Water Station
+
+```{r}
+joined_toc <- bind_rows(check_rwss_toc, check_intake_toc)%>%
+  mutate(site = ifelse(site == "PRW [331]", "RWSS", "Intake"))%>%
+  pivot_wider(id_cols = "date", names_from = site, values_from = mean_TOC)
+
+
+cor(joined_toc$RWSS, joined_toc$Intake, use = "complete.obs")
+
+ggplot(joined_toc, aes(Intake, RWSS))+
+  geom_point()+
+  geom_abline(slope = 1, linetype = "dashed")+
+  coord_cartesian(xlim = c(2,13), ylim = c(2,13))+
+  labs(title = "TOC Comparison between CLP Intake and CLP Raw Water Station", x = "Intake TOC", y = "Raw Water Station TOC")+
+  ROSS_theme
+
+ggplot(joined_toc, aes(date, RWSS))+
+  geom_point(aes(color = "RWSS"))+
+  geom_point(aes(y = Intake, color = "Intake"))+
+  #coord_cartesian(xlim = c(2,13), ylim = c(2,13))+
+  labs(title = "TOC Comparison between CLP Intake and CLP Raw Water Station", 
+       caption = "Intake samples are primarily taken during snowmelt and can be slightly higher than RWSS samples",
+       x = "Date", y = "TOC")+
+  ROSS_theme
+
+ggplot(joined_toc)+
+  geom_histogram(aes(x = RWSS), fill = "blue")+
+  geom_histogram(aes(x = Intake), fill = "red")+
+  #coord_cartesian(xlim = c(2,13), ylim = c(2,13))+
+  labs(title = "TOC Comparison between CLP Intake and CLP Raw Water Station", x = "TOC (mg/L)")+
+  ROSS_theme
+
+fc_intake <- check_rwss_toc
+```
+Seems like the Raw Water Station is fine to predict the Intake TOC. Seems like RWSS is possibly skewed lower as it includes more baseflow samples than the Intake, which is primarily sampled during snowmelt.
+
+
+# Read in Features
+
+## Read in new Snotel
+
+```{r}
+swe_pca <- read_rds(here("data/derived/models/TOC_intake/SWE_PCA_v2026-02-18.rds"))
+
+# grab snotel sites in the HUC
+snotel_sites <- snotel_info() %>%
+  filter(grepl("10190007", description))
+
+new_snotel <- snotel_download(site_id = snotel_sites$site_id,
+                              internal = TRUE,
+                              metric = TRUE)  %>% 
+  mutate(date = ymd(date),
+         doy = yday(date),
+         year = year(date)) %>% 
+  select(date, site_id, snow_water_equivalent) %>% 
+  #pivot sitewise to get ready for PCA
+  pivot_wider(names_from = site_id, 
+              names_prefix = "swe_",
+              values_from = snow_water_equivalent) %>% 
+  .[complete.cases(.), ] %>% 
+  #PCA time
+  mutate(swe_pca = predict(swe_pca, .)[,"PC1"]) %>% 
+  select(date, swe_pca)
+
+snotel_melt <- new_snotel %>% 
+  # calculate 14-day melt
+  arrange(date) %>% 
+  mutate(date_m14 = date - days(14), 
+         date_m7 = date - days(7)) %>%
+  # join for differences
+  left_join(new_snotel %>%
+              select(date, swe_pca) %>%
+              rename(date_m14 = date,
+                     swe_pca_lag14 = swe_pca),
+            by = "date_m14") %>%
+    left_join(new_snotel %>%
+              select(date, swe_pca) %>%
+              rename(date_m7 = date,
+                     swe_pca_lag7 = swe_pca),
+            by = "date_m7") %>%
+  # compute melt rate
+  mutate(melt_rate_14d = (swe_pca_lag14 - swe_pca) / 14, 
+         melt_rate_7d = (swe_pca_lag7 - swe_pca) / 7) %>%
+  select(-c(date_m14, date_m7, swe_pca_lag14, swe_pca_lag7))%>%
+  mutate(year = year(date),
+         doy = yday(date), 
+         wy_doy = if_else(doy >= 274, doy - 273, doy + 92), 
+         wyear = if_else(doy >= 274, year + 1, year))
+
+new_snotel_melt <- snotel_melt %>%
+  select(date, swe_pca, melt_rate_14d, melt_rate_7d)%>%
+  filter(year(date) == 2026)
+```
+
+## Get Observed Flow
+
+```{r}
+flow_data <- get_sw_ts(abbrev = "CLAFTCCO",
+                       start_date = "2010-01-01",
+                       end_date = "2026-12-31",
+                       timescale = "day") %>%
+  select(datetime, canyon_mouth_cfs_obs = value) %>% 
+  mutate(date = date(datetime), 
+         year = year(date),
+         doy = yday(date))%>%
+  filter(doy>=60, doy <= 300)
+
+```
+
+## Get HEFs forecast for 2026
+
+
+```{r}
+# This only needs to be run once each time we get a new batch of data from FC so we can save it to a parquet file and read it back in for future runs. The code below is commented out because it takes a long time to run and we already have the parquet file saved.
+
+# source(here("src/hefs/get_hefs_ensembles_cbrfc.R"))
+# 
+# forecasted_q_26 <- map(c("2026"),
+#                   ~ {
+#                     dates <- seq.Date(paste0(.x, "-03-01"), paste0(.x, "-7-31"))
+#                     map(dates,
+#                         ~ tryCatch({
+#                           get_hefs_ensembles_cbrfc(ID = "FTDC2", date = .x) %>%
+#                             mutate(valid_date = .x)
+#                         }, error = function(e) {
+#                           NULL
+#                         })) %>%
+#                       bind_rows()
+#                   }) %>%
+#   bind_rows()%>% # each of the forecasts start at noon, and we want the daily average, so we'll
+#   # subtract 12 to get an average of the "next day"
+#   mutate(date_24h = date(date_time - hours(12))) %>%
+#   summarize(across(c(ens_1990:ens_2018, ens_2019),
+#                    ~ mean(.x)),
+#             .by = c(forecast_date, date_24h))
+# #save to parquet
+# write_parquet(forecasted_q_26, here("data/raw/external_datasets/flow_forecast_HEFS/HEFS_20260301_20260731_forecast.parquet"))
+# read back in to test
+forecasted_q_26 <- read_parquet(here("data/raw/external_datasets/flow_forecast_HEFS/HEFS_20260301_20260731_forecast.parquet"))
+
+# pivot to vertical to make the probabilistic forecast
+forecasted_q_vert_26 <- forecasted_q_26 %>% 
+  pivot_longer(cols = c(ens_1990:ens_2019),
+               names_to = "ensemble_member",
+               values_to = "canyon_mouth_cfs") %>% 
+  rename(date = forecast_date)
+
+```
+
+
+
+### Plots of 2026 conditions 
+
+```{r, fig.dim=c(12, 10)}
+
+toc_long <- bind_rows(
+    new_toc %>% 
+      filter(between(doy, 0, 200)) %>%
+      select(date, year, doy, value = mean_TOC) %>%
+      mutate(panel = "TOC~(mg L⁻¹)"),
+    fc_intake %>% 
+      mutate(year = year(date),
+             doy = yday(date)) %>%
+      filter(year(date) > 2022, between(doy, 0, 200)) %>%
+      select(date, year, doy, value = mean_TOC) %>%
+      mutate(panel = "TOC~(mg L⁻¹)")
+  )
+
+swe_long <- snotel_melt %>%
+  filter(year >= 2023, between(doy, 0, 200)) %>%
+  select(date, year, doy, value = melt_rate_14d) %>%
+  mutate(panel = "14 day SWE Melt Rate\n(PCA Units/day)")
+
+flow_long <- flow_data %>%
+  filter(year(date) > 2022, between(doy, 0, 200)) %>%
+  mutate(doy = yday(date)) %>%
+  select(date, year, doy, value = canyon_mouth_cfs_obs) %>%
+  mutate(panel = "Flow (cfs)")
+
+conditions_panel_labels <- c(
+  "SWE"  = '"14 day SWE Melt Rate\n(PCA Units/day)"',
+  "Flow" = '"Flow (cfs)"',
+    "TOC"  = 'TOC~(mg ~ L^-1)'
+)
+
+# Update the panel column to use short keys
+combined <- bind_rows(toc_long, swe_long, flow_long) %>%
+  mutate(
+    year_group = ifelse(year == 2026, "2026", "2023-2025"),
+    panel = factor(
+      case_when(
+        panel == "TOC~(mg L⁻¹)"             ~ "TOC",
+        panel == "14 day SWE Melt Rate\n(PCA Units/day)" ~ "SWE",
+        panel == "Flow (cfs)"               ~ "Flow"
+      ),
+      levels = c( "SWE", "Flow", "TOC")
+    )
+  )
+
+
+swe_annotations <- tibble(
+  panel  = factor("SWE", levels = c( "SWE", "Flow", "TOC")),  # ← short key now
+  doy    = c(50, 50),
+  value  = c(0.1, -0.1),
+  label  = c("Melt", "Accumulation"),
+  color  = c("red", "blue")
+)
+
+ggplot(combined, aes(x = doy, y = value, group = interaction(year, year_group))) +
+  geom_line(data = ~filter(.x, year_group == "2023-2025"),
+            aes(color = year_group), linewidth = 0.5, alpha = 0.3) +
+  geom_line(data = ~filter(.x, year_group == "2026"),
+            aes(color = year_group), linewidth = 1.5) +
+geom_hline(
+  data = ~filter(.x, panel == "SWE"),  # ← short key now
+  yintercept = 0, linetype = "dashed", color = "black"
+)+
+  geom_text(data = swe_annotations,
+            aes(x = doy, y = value, label = label, color = color),
+            inherit.aes = FALSE, size = 5.5, fontface = "bold") +
+  scale_color_manual(
+    name = "Year",
+    values = c("2023-2025" = "grey50", "2026" = "#256BF5", 
+               "red" = "red", "blue" = "blue"),
+    breaks = c("2023-2025", "2026")  
+  ) +
+  scale_x_continuous(
+    breaks = c(1, 32, 60, 91, 121, 152, 182),
+    labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul")
+  ) + 
+facet_wrap(~ panel, ncol = 1, scales = "free_y", 
+           strip.position = "left",
+           labeller = as_labeller(conditions_panel_labels, default = label_parsed)) +
+  tagger::tag_facets(tag_pool = c("a", "b", "c"), position = "tl") +
+labs(
+    x = "Date",
+    y = NULL,
+    title = "Poudre River Intake TOC, SWE Melt Rate, and Canyon Mouth Flow in 2026",
+    subtitle = "Compared to 2023-2025 conditions"
+  ) +
+  theme_bw() +
+  theme(
+    strip.placement   = "outside",
+    strip.background  = element_blank(),
+    strip.text        = element_text(size = 14),
+    legend.position   = "right",
+    plot.title        = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle     = element_text(size = 11, hjust = 0.5, color = "grey30"),
+    panel.grid.minor  = element_blank()
+  )
+
+ggsave(
+  filename = here("docs/uclp_dss/figs/forecast_toc/", "2026_toc_swe_flow_conditions.png"),
+  width = 8,
+  height = 10,
+  dpi = 300)
+```
+
+
+
+# Create datasets to forecast on
+
+```{r}
+# join with location data, and reduce columns
+toc_q_26 <- left_join(new_toc, forecasted_q_vert_26,
+                   relationship = "one-to-many") %>%
+  filter(!is.na(canyon_mouth_cfs)) %>% 
+  select(date, date_24h, year, canyon_mouth_cfs)  %>% 
+  mutate(doy = yday(date_24h))
+
+toc_q_swe_26 <- left_join(toc_q_26, new_snotel_melt) %>%
+  filter(!is.na(swe_pca)) %>% 
+  select(date, date_24h, year, canyon_mouth_cfs, swe_pca, melt_rate_14d, melt_rate_7d)  %>% 
+  mutate(doy = yday(date_24h))
+
+```
+
+
+
+# Apply Models
+
+```{r}
+
+plot_data_26 <- toc_q_swe_26 %>% 
+  mutate(horizon = as.integer(date_24h - date)) %>%
+  # Standard join to pull in the observed TOC
+  inner_join(select(new_toc, date, mean_TOC), by = "date") %>%
+  add_toc_gam_preds() %>%
+  rename(pred_TOC = pred) %>%
+  mutate(horizon_label = if_else(horizon == 1, "1 Day", paste(horizon, "Days"))) %>%
+  filter(!is.na(mean_TOC), horizon %in% 1:7)
+
+#calculate the 10 and 90 percentiles for the predicted TOC values for each combination of mean_TOC, date, model, and horizon_label
+plot_data_sum_26 <- plot_data_26 %>% 
+  group_by(mean_TOC, date, model, horizon_label) %>% 
+  summarize(
+    med_pred = median(pred_TOC),
+    lower_bound = quantile(pred_TOC, 0.10), # 10th percentile
+    upper_bound = quantile(pred_TOC, 0.90), # 90th percentile
+    .groups = "drop"
+  )
+```
+
+## Calculate GAM results on observed values and make it ready for plotting
+
+```{r}
+
+actual_2026 <- flow_data  %>%
+  filter(between(date, min(new_toc$date, na.rm = T), max(new_toc$date, na.rm = T)))%>%
+  rename(canyon_mouth_cfs = canyon_mouth_cfs_obs) %>%
+  left_join(new_snotel_melt, by = "date")%>%
+  mutate(doy = yday(date))%>%
+  left_join(new_toc %>% select(date, mean_TOC), by = "date")%>%
+  add_toc_gam_preds() %>%
+  filter(!is.na(mean_TOC))%>%
+  mutate(horizon_label = "Observed")
+
+
+```
+
+
+## Plot 2026 results
+
+### Obs vs pred
+```{r, fig.dim=c(14, 8)}
+plot_data_sum_26%>%
+  filter(horizon_label %in% c("1 Day","3 Days", "7 Days"))%>%
+ggplot(., aes(x = mean_TOC, y = med_pred, color = date)) + 
+  geom_linerange(aes(ymin = lower_bound, ymax = upper_bound), alpha = 0.5, color = "grey30") +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_abline(intercept = 0, slope = 1, lty = 2, color = "red") +
+  coord_cartesian(xlim = c(2,10), ylim = c(2,10)) +
+  scale_x_continuous(breaks = seq(2, 10, 2), labels = seq(2, 10, 2))+
+  scale_y_continuous(breaks = seq(2, 12, 4), labels = seq(2, 12, 4))+
+  facet_grid(horizon_label ~ model) +
+  labs(
+    x =  bquote("Observed" ~ .(chem_expressions$TOC[[1]])),
+    y = bquote("Predicted" ~ .(chem_expressions$TOC[[1]])),
+    title = "Intake TOC Model Performance on 2026 Data"
+  ) +
+scale_color_viridis_c(
+    name = "Date", 
+    option = "D",
+    direction = -1,
+    labels = function(x) format(as.Date(x, origin = "1970-01-01"), "%b %d")
+  ) +
+  ROSS_theme +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        axis.title = element_text(size = 16, face = "bold"), 
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 14, face = "bold"), 
+        strip.text.y = element_text(angle = -90)
+  )
+
+ggsave(here("docs/uclp_dss/figs/forecast_toc/", "toc_forecast_2026_137_pres.png"), 
+       width = 14, 
+       height = 8, 
+       dpi = 300)
+
+```
+### Adding in actual
+
+```{r, fig.dim=c(12, 12)}
+plot_data_sum_26%>%
+  filter(horizon_label %in% c("1 Day","3 Days", "7 Days"))%>%
+  bind_rows(actual_2026 %>%select(mean_TOC, date, model, horizon_label, med_pred = pred))%>%
+  mutate(horizon_label = factor(horizon_label, levels = c("Observed", "1 Day", "3 Days", "7 Days"))) %>%
+ggplot(., aes(x = mean_TOC, y = med_pred, color = date)) + 
+  geom_linerange(aes(ymin = lower_bound, ymax = upper_bound), alpha = 0.5, color = "grey30") +
+  geom_point(alpha = 0.7, size = 2.5) +
+  geom_abline(intercept = 0, slope = 1, lty = 2, color = "red") +
+  coord_cartesian(xlim = c(2,10), ylim = c(2,10)) +
+  scale_x_continuous(breaks = seq(2, 10, 2), labels = seq(2, 10, 2))+
+  scale_y_continuous(breaks = seq(2, 10, 2), labels = seq(2, 10, 2))+
+  facet_grid(horizon_label ~ model) +
+  labs(
+    x =  bquote("Observed" ~ .(chem_expressions$TOC[[1]])),
+    y = bquote("Predicted" ~ .(chem_expressions$TOC[[1]])),
+    title = "Intake TOC Model Performance on 2026 Data"
+  ) +
+scale_color_viridis_c(
+    name = "Date", 
+    option = "D",
+    direction = -1,
+    labels = function(x) format(as.Date(x, origin = "1970-01-01"), "%b %d")
+  ) +
+  ROSS_theme +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        axis.title = element_text(size = 16, face = "bold"), 
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 14, face = "bold"), 
+        strip.text.y = element_text(angle = -90)
+  )
+ggsave(here("docs/uclp_dss/figs/forecast_toc/", "toc_forecast_2026_obs137.png"), 
+       width = 12, 
+       height = 12, 
+       dpi = 300)
+
+```
+
+
+# Evaluating the Forecasts
+
+## CRPS
+
+```{r}
+toc_preds_swe_preds_26 <- toc_q_swe_26 %>% 
+  mutate(horizon = as.integer(date_24h - date))%>%
+  mutate(pred_doy_int = as.numeric(predict(q_doy_int, .)),
+         pred_doy_swe = as.numeric(predict(q_doy_swe, .)), 
+         pred_doy_swe_7 = as.numeric(predict(q_doy_swe_7d, .)))
+```
+
+
+```{r, fig.dim=c(14, 6), message = FALSE}
+
+crps_toc_26 <- map(seq(1:7),
+    ~ toc_preds_swe_preds_26 %>% 
+      mutate(date = date + days(.x-1)) %>% 
+      filter(date == date_24h) %>%
+      inner_join(., new_toc %>% select(date, mean_TOC)) %>% 
+      mutate(horizon = .x) %>% 
+      summarize(mean_toc_pred_swe = mean(pred_doy_swe), 
+                mean_toc_q_doy_int = mean(pred_doy_int),
+                mean_toc_q_doy_swe_7 = mean(pred_doy_swe_7),
+                sd_toc_pred_swe = sd(pred_doy_swe),
+                sd_toc_q_doy_int = sd(pred_doy_int),
+                sd_toc_q_doy_swe_7 = sd(pred_doy_swe_7),
+                n = n(),
+                .by = c(horizon, date, mean_TOC))) %>% 
+  bind_rows() %>% 
+  filter(n > 10) %>% 
+  rowwise() %>% 
+  mutate(crps_daily_swe = verification::crps(mean_TOC, c(mean_toc_pred_swe, sd_toc_pred_swe))$crps, 
+         crps_daily_int = verification::crps(mean_TOC, c(mean_toc_q_doy_int, sd_toc_q_doy_int))$crps, 
+         crps_daily_swe_7 = verification::crps(mean_TOC, c(mean_toc_q_doy_swe_7, sd_toc_q_doy_swe_7))$crps) %>% 
+  ungroup() %>% 
+  select(horizon, crps_daily_int, crps_daily_swe, crps_daily_swe_7, date)%>%
+  filter(!is.na(crps_daily_swe), !is.na(crps_daily_int))%>%
+  pivot_longer(cols = c(crps_daily_swe, crps_daily_int, crps_daily_swe_7), 
+               names_to = "model", 
+               values_to = "crps_daily") %>%
+  mutate(model = case_when(
+    model == "crps_daily_swe" ~ "DOY + Q + SWE 14d Model",
+    model == "crps_daily_int" ~ "DOY + Q Model", 
+    model == "crps_daily_swe_7" ~ "DOY + Q + SWE 7d Model"
+  ),
+  horizon_label = paste("Horizon:", horizon, "days"), 
+  model = factor(model, levels = c("DOY + Q Model", "DOY + Q + SWE 14d Model", "DOY + Q + SWE 7d Model")))
+
+crps_toc_26_plot <- crps_toc_26%>%
+ ggplot(., aes(x = horizon, y = crps_daily)) +
+  geom_boxplot(aes(group = horizon)) +
+  #geom_hline(data = actual_mae_2026, aes(yintercept = crps_daily), linetype = "dashed", size = 1) +
+  #geom_dotplot( aes(fill = model, group = horizon),binaxis = "y", stackdir = "center", dotsize = 0.5, position = position_dodge(width = 0.5)) +
+  theme_bw(base_size = 20) +
+  facet_wrap(~ model) +
+  labs(y = chem_expressions$crps_toc,
+       x = "Forecast Horizon (Days)")+
+       #title = paste0("CRPS for intake TOC forecast Spring 2026 (n = ", nrow(new_toc), ")"))+
+  scale_x_continuous(n.breaks = 7) +
+  ROSS_theme +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 16, face = "bold"), 
+        strip.text.y = element_text(angle = -90)
+  )
+
+crps_toc_26_plot
+ggsave(here("docs/uclp_dss/figs/forecast_toc/", "toc_crps_2026.png"), 
+       width = 14, 
+       height = 6, 
+       dpi = 300)
+```
+
+## CRPSS 
+To compute the CRPSS, we need to calculate the CRPS for a baseline model. In this case, we will use a simple baseline model that predicts the mean TOC value for each day of the year (DOY) based on historical data. We will then compare the CRPS of our forecast models to this baseline model.
+
+```{r, fig.dim=c(14, 6), message = FALSE}
+
+TOC_baseline <- fc_intake%>%
+  mutate(doy = yday(date))%>%
+  group_by(doy) %>%
+  summarize(baseline_pred_mean_toc = mean(mean_TOC, na.rm = TRUE), 
+            baseline_pred_sd_toc = sd(mean_TOC, na.rm = TRUE), 
+            n = n())%>%
+  ungroup()%>%
+  #if SD is missing, grab the mean sd across the dataset
+  mutate(baseline_pred_sd_toc = if_else(is.na(baseline_pred_sd_toc), 
+                                        mean(baseline_pred_sd_toc, na.rm = TRUE), 
+                                        baseline_pred_sd_toc))
+
+
+
+crps_baseline_mapped <- new_toc %>%
+  select(date, mean_TOC) %>%
+  mutate(doy = yday(date)) %>%
+  inner_join(TOC_baseline, by = "doy") %>%
+  rowwise() %>%
+  mutate(
+    crps_baseline = verification::crps(mean_TOC, c(baseline_pred_mean_toc, baseline_pred_sd_toc))$crps
+  ) %>%
+  ungroup() %>%
+  select(date, crps_baseline)
+
+#Join the baseline CRPS with forecast models and compute skill metrics
+crps_skill_results <- crps_toc_26%>%
+  inner_join(crps_baseline_mapped, by = "date") %>%
+  mutate(
+    crps_skill_score = 1 - (crps_daily / crps_baseline),
+    crps_raw_diff = crps_daily - crps_baseline
+  )
+
+crps_skill_2026_plot <- crps_skill_results %>%
+  filter(horizon <= 7 & crps_skill_score > -5) %>%
+  ggplot(aes(x = factor(horizon), y = crps_skill_score)) +
+  geom_violin()+
+stat_summary(
+    fun = "median", 
+    geom = "point", 
+    shape = 18, 
+    size = 3, 
+    fill = "#FFCA3A",
+    position = position_dodge(width = 0.9)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "green4") +
+  facet_wrap(~ model) +
+  labs(
+    y = "CRPS Skill Score\n(DOY Baseline vs. GAMs)",
+    x = "Forecast Horizon (Days)",
+    title = paste0("CRPS Skill Score for intake TOC forecast 2026 Data (n = ", nrow(new_toc), ")"), 
+    caption = "CRPS Skill Scores are calculated as 1 - (CRPS_forecast / CRPS_baseline). A score of 0 indicates no skill, while a score of 1 indicates perfect skill."
+  ) +
+  ROSS_theme +
+  theme(
+    axis.title = element_text(size = 16), 
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 16, face = "bold"), 
+    strip.text.y = element_text(angle = -90)
+  )
+
+crps_skill_2026_plot
+```
+
+
+## Mean Error
+
+```{r, fig.dim=c(14, 6) }
+
+bias_by_horizon_toc_26 <- plot_data_26 %>%  
+  filter(horizon %in% 1:7) %>% 
+  group_by(date, date_24h, horizon, mean_TOC, model) %>%
+  summarize(ens_mean = mean(pred_TOC), .groups = "drop") %>%
+  group_by(horizon, model) %>%
+  summarize(
+    ME   = mean(ens_mean - mean_TOC),
+    MAE  = mean(abs(ens_mean - mean_TOC)),
+    RMSE = sqrt(mean((ens_mean - mean_TOC)^2)),
+    n    = n(),
+    .groups = "drop"
+  )
+
+bias_by_horizon_toc_26_plot <- ggplot(bias_by_horizon_toc_26, aes(x = horizon, y = ME)) +
+  geom_point(aes(color = model), fill = "steelblue") +
+  geom_line(aes(group = model, color = model), linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw(base_size = 14) +
+  scale_color_manual(
+    name = "Model",
+    values = c("DOY + Q Model" = "#FFCA3A", 
+               "DOY + Q + SWE 14d Model" = "#256BF5", 
+               "DOY + Q + SWE 7d Model" = "#FF5733")
+  ) +
+    scale_x_continuous(n.breaks = 7) +
+
+labs(
+    x = "Forecast Horizon (days)",
+    y = bquote("Mean Error "~ .(chem_expressions$mgL[[1]])),
+    #title = "TOC Forecast Bias by Horizon", 
+    #subtitle = paste0("Spring 2026 (n = ", nrow(new_toc), ")")
+  )+
+    theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 16, face = "bold"), 
+        strip.text.y = element_text(angle = -90)
+  )
+bias_by_horizon_toc_26_plot
+
+```
+
+
+# Plot of Forecasts vs actual over TS space
+
+```{r, fig.dim=c(14, 10)}
+
+all_2026 <- forecasted_q_vert_26%>%
+  filter(!is.na(canyon_mouth_cfs)) %>% 
+  select(date, date_24h, canyon_mouth_cfs)  %>% 
+  mutate(doy = yday(date_24h))%>%
+  left_join(.,new_snotel_melt, by = "date")%>%
+  filter(!is.na(swe_pca)) %>% 
+  select(date, date_24h, canyon_mouth_cfs, swe_pca, melt_rate_14d, melt_rate_7d)  %>% 
+  mutate(doy = yday(date_24h)) %>% 
+  mutate(horizon = as.integer(date_24h - date))%>%
+  mutate(pred_doy_int = as.numeric(predict(q_doy_int, .)),
+         pred_doy_swe = as.numeric(predict(q_doy_swe, .)), 
+         pred_doy_swe_7 = as.numeric(predict(q_doy_swe_7d, .)))%>%
+  filter(horizon <= 7)%>%
+  na.omit()
+
+
+real_time_preds_2026 <- all_2026 %>%
+  #filter(date >= "2026-04-10"& date <= max(new_toc$date))%>%
+  pivot_longer(cols = all_of(model_levels), names_to = "model", values_to = "pred") %>%
+  mutate(model = factor(model, levels = model_levels, labels = model_labels)) %>%
+  summarise(
+    med_pred = median(pred), 
+    lower_bound = quantile(pred, 0.10), 
+    upper_bound = quantile(pred, 0.90), .by = c("model","date_24h","date")
+  )
+
+real_time_preds_2026 %>%
+  filter(model %in% c( "DOY + Q + SWE 14d Model", "DOY + Q Model", "DOY + Q + SWE 7d Model") & date_24h <= max(new_toc$date) + days(7))%>%
+  ggplot(aes(x = date_24h, y = med_pred)) +
+  geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound, group = date, fill = date),  alpha = 0.2) +
+  geom_line(aes(color = date, group = date), linewidth = 0.8) +
+  geom_line(data = new_toc,
+            aes(x = date, y = mean_TOC), color = "black", linewidth = 1) +
+  geom_point(data = new_toc,
+             aes(x = date, y = mean_TOC), color = "black", size = 1.5) +
+  scale_color_date( name = "Forecast Run") +
+  scale_fill_date( name = "Forecast Run") +
+  facet_wrap(model ~ .) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 14)
+  ) +
+  labs(
+    x = "Date", 
+    y = bquote("TOC (" ~ mg ~ L^-1 ~ ")"), 
+    title = "Intake TOC Forecasts vs. Observed Values in Spring 2026",
+    subtitle = "Shaded area represents 10th-90th percentile range of ensemble predictions"
+  )+
+  ROSS_theme
+```
+
+
+# Assessing forecasted product errors
+
+We will test how error metrics change when we use the forecasted Q and SWE values as inputs to the model, instead of the observed Q and SWE values. This will give us a sense of how much error is being introduced into the TOC forecasts by using forecasted inputs, which is important for understanding how these models might perform in real-time forecasting scenarios where we don't have access to observed future Q and SWE.
+
+Note: `actual_2026` / `actual_2026_metrics` (the observed-input baseline, used as the "horizon == 0"
+reference for every plot below) is computed once, in the next section ("Real Data"), and reused
+everywhere else. Each forecast-input scenario below (HEFS flow, continuous SWE, HEFS + SWE) follows
+the same recipe: build the input dataset for that scenario, run it through `add_toc_gam_preds()` and
+`summarize_toc_error()`, then `bind_rows()` the observed-input baseline back on as the horizon-0 point.
+
+### Observed Data 
+
+```{r}
+
+actual_2026 <- flow_data  %>%
+  filter(between(date, min(new_toc$date, na.rm = T) - days(1), max(new_toc$date, na.rm = T) + days(1)))%>%
+  rename(canyon_mouth_cfs = canyon_mouth_cfs_obs) %>%
+  left_join(new_snotel_melt, by = "date")%>%
+  mutate(doy = yday(date))%>%
+  left_join(new_toc %>% select(date, mean_TOC), by = "date")
+
+actual_2026_metrics <- actual_2026 %>%
+  add_toc_gam_preds() %>%
+  summarize_toc_error(group_vars = "model") %>%
+  # repeat this dataframe for each horizon (0-7) so it can be plotted as the
+  # flat "Observed" reference line/point across every forecast horizon
+  slice(rep(1:n(), each = 8), .by = c(model, metric)) %>%
+  mutate(horizon = rep(0:7, times = n() / 8), .by = c(model, metric))
+
+```
+
+
+## HEFS Forecasted Flow
+
+
+```{r}
+
+hefs_real_swe_2026 <- forecasted_q_vert_26 %>%
+  filter(!is.na(canyon_mouth_cfs)) %>% 
+  select(date, date_24h, canyon_mouth_cfs)  %>% 
+  summarize(across(c(canyon_mouth_cfs), ~ mean(.x)), .by = c(date, date_24h))%>%
+  mutate(horizon = as.integer(date_24h - date))%>%
+  left_join(.,new_snotel_melt, by = c("date_24h" =  "date"))%>%
+  left_join(new_toc %>% select(date, mean_TOC), by = c("date_24h" = "date"))%>%
+  mutate(doy = yday(date_24h))%>%
+  filter(!is.na(mean_TOC), between(horizon, 1, 7)) %>%
+  add_toc_gam_preds() %>%
+  summarize_toc_error() %>%
+  bind_rows(actual_2026_metrics %>% filter(horizon == 0))
+
+```
+
+
+### Observed Flow + Fixed SWE
+
+```{r}
+
+real_flow_cont_swe <- new_snotel_melt %>%
+  select(date, swe_pca, melt_rate_14d, melt_rate_7d) %>%
+  cross_join(tibble(horizon = 1:7)) %>%
+  mutate(date_24h = date + days(horizon))%>%
+  mutate(doy = yday(date_24h))%>%
+    left_join(
+    flow_data %>% 
+      rename(canyon_mouth_cfs = canyon_mouth_cfs_obs) %>%
+      select(date, canyon_mouth_cfs),
+    by = c("date_24h" = "date")
+  ) %>%
+  left_join(
+    new_toc %>% select(date, mean_TOC),
+    by = c("date_24h" = "date")
+  ) %>%
+  filter(!is.na(canyon_mouth_cfs), !is.na(swe_pca), !is.na(mean_TOC), between(horizon, 1, 7)) %>%
+  add_toc_gam_preds() %>%
+  summarize_toc_error() %>%
+  bind_rows(actual_2026_metrics %>% filter(horizon == 0))
+
+```
+
+
+### HEFS Flow & Fixed SWE
+
+```{r}
+
+hefs_swe_26 <-  forecasted_q_vert_26 %>%
+  filter(!is.na(canyon_mouth_cfs)) %>% 
+  select(date, date_24h, canyon_mouth_cfs)  %>% 
+  summarize(across(c(canyon_mouth_cfs), ~ mean(.x)), .by = c(date, date_24h))%>%
+  mutate(horizon = as.integer(date_24h - date))%>%
+  left_join(.,new_snotel_melt, by = c("date"))%>%
+  left_join(new_toc %>% select(date, mean_TOC), by = c("date_24h" = "date"))%>%
+  mutate(doy = yday(date_24h))%>%
+  filter(!is.na(canyon_mouth_cfs), !is.na(swe_pca), !is.na(mean_TOC), between(horizon, 1, 7)) %>%
+  add_toc_gam_preds() %>%
+  summarize_toc_error() %>%
+  bind_rows(actual_2026_metrics %>% filter(horizon == 0))
+
+```
+
+
+
+```{r, fig.dim=c(14, 8)}
+ggplot(actual_2026_metrics%>%filter(metric == "RMSE"), aes(x = horizon, y = value)) +
+  geom_line(data = actual_2026_metrics%>%filter(metric == "RMSE"), aes(color = "Observed"), linewidth = 1.1) +
+  geom_point(data = actual_2026_metrics%>%filter(metric == "RMSE"), aes(color = "Observed"), size = 2) +
+  geom_line(data = hefs_swe_26%>%filter(metric == "RMSE"& model != "DOY + Q Model"),           aes(color = "HEFS & SWE", group = model), linewidth = 1.1) +
+  geom_point(data = hefs_swe_26%>%filter(metric == "RMSE"& model != "DOY + Q Model"),          aes(color = "HEFS & SWE", group = model), size = 2) +
+  geom_line(data = hefs_real_swe_2026%>%filter(metric == "RMSE"),        aes(color = "HEFS", group = model), linewidth = 1.1) +
+  geom_point(data = hefs_real_swe_2026%>%filter(metric == "RMSE"),         aes(color = "HEFS", group = model), size = 2) +
+  geom_line(data = real_flow_cont_swe%>%filter(metric == "RMSE" & model != "DOY + Q Model"),   aes(color = "SWE", group = model), linewidth = 1.1) +
+  geom_point(data = real_flow_cont_swe%>%filter(metric == "RMSE" & model != "DOY + Q Model"),   aes(color = "SWE", group = model), size = 2) +
+
+#  geom_hline(yintercept = 0, linetype = "longdash", color = "grey40", linewidth = 0.8) +
+  scale_color_manual(
+    name = "Input Condition", 
+    values = c(
+      "Observed"   = "#E6A100",  
+      "HEFS"       = "#E70870",  
+      "SWE"        = "#256BF5",  
+      "HEFS & SWE" = "#FF6B6B"   
+    ),
+    breaks = c("Observed", "HEFS", "SWE", "HEFS & SWE") 
+  ) +
+  # scale_linetype_manual(
+  #   name = "GAM Model", 
+  #   values = c(
+  #     "DOY + Q Model"           = "solid", 
+  #     "DOY + Q + SWE 7d Model"  = "dashed", 
+  #     "DOY + Q + SWE 14d Model" = "dotted"
+  #   ), 
+  #   breaks = c("DOY + Q Model", "DOY + Q + SWE 7d Model", "DOY + Q + SWE 14d Model")
+  # ) +
+  facet_wrap(~model)+
+  scale_x_continuous(breaks = 0:7, limits = c(0, 7)) + 
+  
+  labs(
+    x = "Forecast Horizon (days)",
+    y = bquote(RMSE ~ TOC ~ (mg ~ L^-1)),
+    title = "TOC Forecast Error by Horizon: Actual vs. SWE & HEFS Forecasted Inputs", 
+    subtitle = paste0("Spring 2026 (n = ", nrow(new_toc), ")")
+  ) +
+  ROSS_theme+
+  theme(
+    axis.title         = element_text(size = 14), 
+    axis.text          = element_text(size = 11),
+    strip.background   = element_blank(), # Removes heavy grey strip box
+    strip.text         = element_text(size = 13, face = "bold"), 
+    panel.grid.minor   = element_blank(),
+    legend.position    = "right",
+    legend.title       = element_text(face = "bold", size = 11),
+    legend.text        = element_text(size = 10)
+  )
+
+ggsave(here("docs/uclp_dss/figs/paper_figs/", "toc_error_metrics_2026.png"), 
+       width = 14, 
+       height = 8, 
+       dpi = 300)
+```
+
